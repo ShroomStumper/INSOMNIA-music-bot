@@ -1,0 +1,468 @@
+import discord
+from discord.ext import commands
+import yt_dlp
+from discord import app_commands
+import asyncio
+from collections import deque
+import re
+from typing import Optional
+import logging
+import sys
+import json
+import subprocess
+import os
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('INSOMNIA')
+
+# Replace with your bot token. 
+BOT_TOKEN = 'shit your bot token here buddy'
+
+# Directory where player settings are saved
+SETTINGS_DIR = "settings"
+
+class MusicPlayer:
+    def __init__(self, guild_id: int):
+        self.queue = deque()
+        self.current = None
+        self.voice_client = None
+        self.loop = False
+        self._volume = 1.0
+        self.guild_id = guild_id
+        self.song_history = []
+        self.playlists = {}  # Dictionary to store playlists for this guild
+        self.now_playing_message = None  # Add this attribute to store the now playing message
+        self.load_settings()
+
+    def save_settings(self):
+        data = {
+            "volume": self._volume,
+            "loop": self.loop,
+            "playlists": self.playlists
+        }
+        with open(f"{SETTINGS_DIR}/{self.guild_id}.json", "w") as f:
+            json.dump(data, f, indent=4)
+
+    def load_settings(self):
+        try:
+            with open(f"{SETTINGS_DIR}/{self.guild_id}.json", "r") as f:
+                data = json.load(f)
+                self._volume = data["volume"]
+                self.loop = data["loop"]
+                self.playlists = data["playlists"]
+        except FileNotFoundError:
+            pass  # Ignore if settings file doesn't exist
+
+    @property
+    def is_playing(self):
+        return self.voice_client and self.voice_client.is_playing()
+
+    @property
+    def volume(self):
+        return self._volume
+    
+    @volume.setter
+    def volume(self, value):
+        self._volume = value
+        if self.voice_client:
+            self.voice_client.source.volume = value
+
+class INSOMNIA(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.voice_states = True
+        super().__init__(command_prefix="!", intents=intents)
+        self.music_players = {}
+        
+    def get_player(self, guild_id: int) -> MusicPlayer:
+        if guild_id not in self.music_players:
+            self.music_players[guild_id] = MusicPlayer(guild_id)
+        return self.music_players[guild_id]
+
+bot = INSOMNIA()
+
+class Music(commands.GroupCog, name="music"):
+    def __init__(self, bot):
+        self.bot = bot
+        self.setup_ytdl()
+        super().__init__()
+
+    def setup_ytdl(self):
+        self.ydl_opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        }
+        self.ytdl = yt_dlp.YoutubeDL(self.ydl_opts)
+
+    async def get_song_info(self, query: str) -> Optional[dict]:
+        try:
+            # Attempt to get info from direct link
+            info = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.ytdl.extract_info(query, download=False)
+            )
+            
+            # Return the result if it's a valid URL
+            if info:
+                return info
+            else:
+                # If it's not a valid URL, search for it as a query
+                info = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.ytdl.extract_info(f"ytsearch:{query}", download=False)
+                )
+                if info and info["entries"]:
+                    return info['entries'][0]
+                else:
+                    logger.error(f"Couldn't find a song matching the query: '{query}'")
+                    return None
+                
+        except Exception as e:
+            logger.error(f"Song info error: {e}")
+            return None
+
+    async def play_next(self, interaction, player):
+        if not player.queue:
+            if player.now_playing_message:
+                await player.now_playing_message.edit(content="🎵 Nothing is currently playing.")
+            player.now_playing_message = None  # Reset now_playing_message
+            return 
+
+        try:
+            song = player.queue.popleft()
+            player.current = song
+
+            source = discord.FFmpegPCMAudio(
+                source=song['url'], 
+                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+            ) # Removed executable
+
+            source.volume = player.volume
+
+            def after_playing(error):
+                if error:
+                    logger.error(f"Playback error: {error}")
+                player.song_history.append(song)  # Add song to history
+                
+                if player.loop and player.queue:
+                    player.queue.append(song) 
+                asyncio.run_coroutine_threadsafe(
+                    self.play_next(interaction, player),
+                    self.bot.loop
+                )
+
+            player.voice_client.play(source, after=after_playing)
+            if player.now_playing_message:
+                await player.now_playing_message.edit(content=f"🎵 Now playing: **{song['title']}** (Requested by: {song['requester']})")
+            else:
+                player.now_playing_message = await interaction.channel.send(f"🎵 Now playing: **{song['title']}** (Requested by: {song['requester']})")
+
+            player.save_settings()
+
+        except (discord.opus.OpusError, Exception) as e:
+            logger.error(f"Playback error: {e}")
+            await interaction.channel.send("❌ Error playing song! (Is FFmpeg in the correct path?)")
+            await self.play_next(interaction, player) # Move to next song
+
+    @app_commands.command(name="p", description="Play a song (URL or name!)")
+    async def play(self, interaction: discord.Interaction, *, query: str):
+        await interaction.response.defer()
+        
+        # Check if user is in a voice channel
+        if not interaction.user.voice:
+            return await interaction.followup.send("❌ Join a voice channel first!")
+        
+        # Get or create player
+        player = self.bot.get_player(interaction.guild.id)
+        
+        # Connect to voice if not already connected
+        if not player.voice_client:
+            try:
+                player.voice_client = await interaction.user.voice.channel.connect()
+            except Exception as e:
+                logger.error(f"Connection error: {e}")
+                return await interaction.followup.send("❌ Couldn't join your channel!")
+
+        # Search for the song
+        song = await self.get_song_info(query)
+        if not song:
+            return await interaction.followup.send("❌ Couldn't find that song!")
+
+        # Add to queue
+        player.queue.append({
+            'url': song['url'],
+            'title': song['title'],
+            'duration': song.get('duration', 0),
+            'requester': interaction.user.name
+        })
+        
+        await interaction.followup.send(f"✅ Added: **{song['title']}** to the queue. Searching and queuing...")
+
+
+        # Start playing if not already
+        if not player.is_playing:
+            await self.play_next(interaction, player)
+
+    @app_commands.command(name="skip", description="Skip the current song")
+    async def skip(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild.id)
+        
+        if not player.voice_client or not player.is_playing:
+            return await interaction.response.send_message("❌ Nothing is playing!")
+            
+        player.voice_client.stop()
+        await interaction.response.send_message("⏭️ Skipped!")
+        if player.now_playing_message:
+            await player.now_playing_message.delete()
+            player.now_playing_message = None
+
+
+    @app_commands.command(name="stop", description="Stop playing and clear queue")
+    async def stop(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild.id)
+        
+        if player.voice_client:
+            player.queue.clear()
+            player.voice_client.stop()
+            await player.voice_client.disconnect()
+            player.voice_client = None
+            await interaction.response.send_message("👋 Stopped and disconnected!")
+        else:
+            await interaction.response.send_message("❌ Not playing anything!")
+        if player.now_playing_message:
+            await player.now_playing_message.delete()
+            player.now_playing_message = None
+
+
+    @app_commands.command(name="queue", description="View the current queue")
+    async def queue(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild.id)
+        if not player.queue:
+            return await interaction.response.send_message("❌ The queue is empty!")
+
+        queue_str = "\n".join(
+            f"**{i+1}.** {song['title']} (Requested by: {song['requester']})"
+            for i, song in enumerate(player.queue)
+        )
+        await interaction.response.send_message(f"**Current Queue:**\n{queue_str}")
+
+
+
+    @app_commands.command(name="loop", description="Loop the current song")
+    async def loop(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild.id)
+        player.loop = not player.loop
+        player.save_settings()
+        await interaction.response.send_message(f"🔁 Loop is now {'on' if player.loop else 'off'}")
+
+    @app_commands.command(name="pause", description="Pause the current song")
+    async def pause(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild.id)
+        if not player.voice_client or not player.is_playing:
+            return await interaction.response.send_message("❌ Nothing is playing!")
+        player.voice_client.pause()
+        await interaction.response.send_message("⏸️ Paused!")
+
+    @app_commands.command(name="resume", description="Resume the current song")
+    async def resume(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild.id)
+        if not player.voice_client or not player.voice_client.is_paused():
+            return await interaction.response.send_message("❌ Nothing is paused!")
+        player.voice_client.resume()
+        await interaction.response.send_message("▶️ Resumed!")
+
+
+    @app_commands.command(name="volume", description="Adjust the volume (0-100)")
+    async def volume(self, interaction: discord.Interaction, volume: int):
+        player = self.bot.get_player(interaction.guild.id)
+        if not player.voice_client:
+            return await interaction.response.send_message("❌ Not connected to a voice channel!")
+
+        if volume < 0 or volume > 100:
+            return await interaction.response.send_message("❌ Invalid volume. Please enter a value between 0 and 100.")
+
+        player.volume = volume / 100
+        player.save_settings()
+        await interaction.response.send_message(f"🔊 Volume set to {volume}%")
+
+    @app_commands.command(name="remove", description="Remove a song from the queue")
+    async def remove(self, interaction: discord.Interaction, position: int):
+        player = self.bot.get_player(interaction.guild.id)
+        if not player.queue:
+            return await interaction.response.send_message("❌ The queue is empty!")
+        
+        if position < 1 or position > len(player.queue):
+            return await interaction.response.send_message(f"❌ Invalid position. Please enter a number between 1 and {len(player.queue)}.")
+        
+        removed_song = player.queue.pop(position - 1)
+        await interaction.response.send_message(f"✅ Removed **{removed_song['title']}** from the queue.")
+
+    @app_commands.command(name="details", description="Show details of a song in the queue")
+    async def details(self, interaction: discord.Interaction, position: int):
+        player = self.bot.get_player(interaction.guild.id)
+        if not player.queue:
+            return await interaction.response.send_message("❌ The queue is empty!")
+        
+        if position < 1 or position > len(player.queue):
+            return await interaction.response.send_message(f"❌ Invalid position. Please enter a number between 1 and {len(player.queue)}.")
+
+        song = player.queue[position - 1]
+        await interaction.response.send_message(f"**Details for song #{position}:**\nTitle: {song['title']}\nURL: {song['url']}\nRequester: {song['requester']}")
+    
+    @app_commands.command(name="shuffle", description="Shuffle the queue")
+    async def shuffle(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild.id)
+        if len(player.queue) < 2:
+            return await interaction.response.send_message("❌ Not enough songs to shuffle.")
+
+        import random
+        random.shuffle(player.queue)
+        await interaction.response.send_message("🔀 Queue shuffled!")
+
+    @app_commands.command(name="clear", description="Clear the queue")
+    async def clear(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild.id)
+        player.queue.clear()
+        await interaction.response.send_message("🗑️ Queue cleared!")
+
+
+    @app_commands.command(name="history", description="View song history")
+    async def history(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild.id)
+        if not player.song_history:
+            return await interaction.response.send_message("❌ No song history yet.")
+        
+        history_str = "\n".join(
+            f"**{i+1}.** {song['title']} (Requested by: {song['requester']})"
+            for i, song in enumerate(player.song_history)
+        )
+        await interaction.response.send_message(f"**Song History:**\n{history_str}")
+
+
+    # Playlist commands
+    @app_commands.command(name="create-playlist", description="Create a new playlist")
+    async def create_playlist(self, interaction: discord.Interaction, playlist_name: str):
+        player = self.bot.get_player(interaction.guild_id)
+        if playlist_name in player.playlists:
+            return await interaction.response.send_message(f"❌ A playlist with that name already exists.")
+
+        player.playlists[playlist_name] = []
+        player.save_settings()
+        await interaction.response.send_message(f"✅ Playlist '{playlist_name}' created!")
+
+    @app_commands.command(name="add-to-playlist", description="Add a song to a playlist")
+    async def add_to_playlist(self, interaction: discord.Interaction, playlist_name: str, *, query: str):
+        player = self.bot.get_player(interaction.guild_id)
+        if playlist_name not in player.playlists:
+            return await interaction.response.send_message(f"❌ Playlist '{playlist_name}' not found.")
+
+        song = await self.get_song_info(query)
+        if not song:
+            return await interaction.response.send_message(f"❌ Song not found.")
+
+        player.playlists[playlist_name].append(
+            {"url": song["url"], "title": song["title"]}
+        )
+        player.save_settings()
+        await interaction.response.send_message(f"✅ Added '{song['title']}' to playlist '{playlist_name}'.")
+
+
+    @app_commands.command(name="play-playlist", description="Play a playlist")
+    async def play_playlist(self, interaction: discord.Interaction, playlist_name: str):
+        player = self.bot.get_player(interaction.guild_id)
+        if playlist_name not in player.playlists:
+            return await interaction.response.send_message(f"❌ Playlist '{playlist_name}' not found.")
+
+        if not player.voice_client:
+            try:
+                player.voice_client = await interaction.user.voice.channel.connect()
+            except Exception as e:
+                logger.error(f"Connection error: {e}")
+                return await interaction.followup.send("❌ Couldn't join your channel!")
+        
+        for song_data in player.playlists[playlist_name]:
+            player.queue.append(
+                {
+                    "url": song_data["url"],
+                    "title": song_data["title"], 
+                    "requester": interaction.user.name
+                }
+            )
+        
+        await interaction.response.send_message(f"✅ Playing playlist '{playlist_name}'.")
+        if not player.is_playing:
+            await self.play_next(interaction, player)
+
+    @app_commands.command(name="delete-playlist", description="Delete a playlist")
+    async def delete_playlist(self, interaction: discord.Interaction, playlist_name: str):
+        player = self.bot.get_player(interaction.guild_id)
+        if playlist_name not in player.playlists:
+            return await interaction.response.send_message(f"❌ Playlist '{playlist_name}' not found.")
+
+        del player.playlists[playlist_name]
+        player.save_settings()
+        await interaction.response.send_message(f"✅ Playlist '{playlist_name}' deleted.")
+
+    @app_commands.command(name="playlist", description="List the playlists")
+    async def list_playlists(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild_id)
+        if not player.playlists:
+            return await interaction.response.send_message("❌ No playlists found.")
+
+        playlist_names = "\n".join(f"- {name}" for name in player.playlists)
+        await interaction.response.send_message(f"**Available Playlists:**\n{playlist_names}")
+
+
+    @app_commands.command(name="close", description="Close the bot and disconnect")
+    async def close(self, interaction: discord.Interaction):
+        player = self.bot.get_player(interaction.guild_id)
+
+        if player.voice_client:
+            await player.voice_client.disconnect()
+            player.voice_client = None
+        
+        await interaction.response.send_message("👋 Closing bot... Goodbye!")
+        await self.bot.close()
+
+@bot.event
+async def on_ready():
+    print("Thank you for choosing INSOMNIA!")
+    logger.info(f"🌙 {bot.user.name} is ready!")
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        logger.error(f"Error syncing commands: {e}")
+    
+    # Set the bot's presence here
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.listening,
+        name="/p to play music"
+    ))
+
+async def setup():
+    await bot.add_cog(Music(bot))
+
+# Ensure settings folder exists
+if not os.path.exists(SETTINGS_DIR):
+    os.makedirs(SETTINGS_DIR)
+
+
+# Run the bot
+async def main():
+    async with bot:
+        await setup()
+        await bot.start(BOT_TOKEN)
+
+
+if __name__ == "__main__":
+    asyncio.run(main()) 
